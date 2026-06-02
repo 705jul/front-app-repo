@@ -172,7 +172,7 @@ function App() {
           <div className="brand">
             <div className="cloud-icon">☁️</div>
             <div>
-              <h1>EKS DEMO Blog</h1>
+              <h1>EKS DEMO Blog - V1</h1>
               <p>
                 Frontend 1개 + Backend 2개 + EKS Ingress + ALB Path Routing
               </p>
