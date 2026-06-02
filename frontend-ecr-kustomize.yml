@@ -1,0 +1,124 @@
+name: Build frontend image and update Kustomize manifest
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_REPOSITORY: eks-demo-frontend
+  MANIFEST_REPO: 705jul/k8s-manifest-repo
+  MANIFEST_BRANCH: main
+  KUSTOMIZE_OVERLAY_PATH: apps/frontend/overlays/prod
+
+jobs:
+  build-push-update-manifest:
+    name: Build, push, and update manifest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout frontend source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set variables
+        shell: bash
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          ECR_IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}"
+
+          SHORT_SHA="${GITHUB_SHA::7}"
+          RANDOM_SUFFIX="$(openssl rand -hex 4)"
+          BUILD_TIME="$(date -u +%Y%m%d%H%M%S)"
+          IMAGE_TAG="front-${BUILD_TIME}-${SHORT_SHA}-${RANDOM_SUFFIX}"
+
+          echo "AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID}" >> $GITHUB_ENV
+          echo "ECR_REGISTRY=${ECR_REGISTRY}" >> $GITHUB_ENV
+          echo "ECR_IMAGE_URI=${ECR_IMAGE_URI}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
+
+          echo "Image URI: ${ECR_IMAGE_URI}:${IMAGE_TAG}"
+
+      - name: Login to Amazon ECR
+        shell: bash
+        run: |
+          aws ecr get-login-password --region "${AWS_REGION}" \
+            | docker login \
+                --username AWS \
+                --password-stdin "${ECR_REGISTRY}"
+
+      - name: Build frontend Docker image
+        shell: bash
+        run: |
+          docker build \
+            -t "${ECR_IMAGE_URI}:${IMAGE_TAG}" \
+            -t "${ECR_IMAGE_URI}:latest" \
+            .
+
+      - name: Push frontend Docker image
+        shell: bash
+        run: |
+          docker push "${ECR_IMAGE_URI}:${IMAGE_TAG}"
+          docker push "${ECR_IMAGE_URI}:latest"
+
+      - name: Checkout k8s manifest repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.MANIFEST_REPO }}
+          ref: ${{ env.MANIFEST_BRANCH }}
+          token: ${{ secrets.MANIFEST_REPO_TOKEN }}
+          path: k8s-manifest-repo
+
+      - name: Install Kustomize
+        shell: bash
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/kustomize
+          kustomize version
+
+      - name: Update frontend image tag in Kustomize
+        shell: bash
+        run: |
+          cd "k8s-manifest-repo/${KUSTOMIZE_OVERLAY_PATH}"
+
+          echo "Before:"
+          cat kustomization.yaml
+
+          kustomize edit set image frontend="${ECR_IMAGE_URI}:${IMAGE_TAG}"
+
+          echo "After:"
+          cat kustomization.yaml
+
+          echo "Rendered manifest preview:"
+          kustomize build .
+
+      - name: Commit and push manifest changes
+        shell: bash
+        run: |
+          cd k8s-manifest-repo
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git status
+          git add "${KUSTOMIZE_OVERLAY_PATH}/kustomization.yaml"
+
+          if git diff --cached --quiet; then
+            echo "No manifest changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore(frontend): update image to ${IMAGE_TAG}"
+          git push origin "${MANIFEST_BRANCH}"
+
